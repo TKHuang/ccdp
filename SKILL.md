@@ -7,8 +7,8 @@ description: Browser automation via Chrome DevTools Protocol. Use for any browse
 
 All commands are shell commands. Run them with the Bash tool.
 
-```
-CDP="node ~/.agents/skills/chrome-cdp-new/scripts/cdp.mjs"
+```bash
+CDP="node <this-skill-dir>/scripts/cdp.mjs"
 ```
 
 ## Workflow
