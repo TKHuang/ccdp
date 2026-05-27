@@ -16,8 +16,9 @@ import {
 } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
-import { spawn, execFileSync } from 'child_process';
+import { spawn, execFileSync, spawnSync } from 'child_process';
 import net from 'net';
+import http from 'http';
 
 const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
@@ -39,12 +40,108 @@ try {
   mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
 } catch {}
 const PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
+const CURRENT_TAB_FILE = resolve(RUNTIME_DIR, 'current-tab');
+// We track which tabs ccdp itself opened so `close all` never touches
+// the user's own tabs. Tabs added via `open` go in; tabs we never opened
+// (i.e. the user's existing tabs) stay out.
+const OWNED_TABS_FILE = resolve(RUNTIME_DIR, 'owned-tabs.json');
+
+function readOwnedTabs() {
+  try {
+    const arr = JSON.parse(readFileSync(OWNED_TABS_FILE, 'utf8'));
+    return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeOwnedTabs(ids) {
+  try {
+    writeFileSync(OWNED_TABS_FILE, JSON.stringify(ids), { mode: 0o600 });
+  } catch {}
+}
+
+function addOwnedTab(targetId) {
+  if (!targetId) return;
+  const owned = readOwnedTabs();
+  if (!owned.includes(targetId)) owned.push(targetId);
+  writeOwnedTabs(owned);
+}
+
+function removeOwnedTab(targetId) {
+  if (!targetId) return;
+  writeOwnedTabs(readOwnedTabs().filter((id) => id !== targetId));
+}
+
+function readCurrentTab() {
+  try {
+    const id = readFileSync(CURRENT_TAB_FILE, 'utf8').trim();
+    return id || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCurrentTab(targetId) {
+  if (!targetId) return;
+  try {
+    writeFileSync(CURRENT_TAB_FILE, targetId, { mode: 0o600 });
+  } catch {}
+}
+
+function clearCurrentTab(targetId) {
+  if (!targetId) return;
+  if (readCurrentTab() === targetId) {
+    try { unlinkSync(CURRENT_TAB_FILE); } catch {}
+  }
+}
 
 function sockPath(targetId) {
   return IS_WINDOWS
     ? `\\\\.\\pipe\\cdp-${targetId}`
     : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
 }
+
+// Known browsers we can probe and auto-launch on each platform.
+// Order matters — we pick the first one whose port file is live.
+const KNOWN_BROWSERS = {
+  arc: {
+    label: 'Arc',
+    darwinApp: '/Applications/Arc.app',
+    darwinBinary: '/Applications/Arc.app/Contents/MacOS/Arc',
+    portFileDir: 'Library/Application Support/Arc/User Data',
+  },
+  chrome: {
+    label: 'Google Chrome',
+    darwinApp: '/Applications/Google Chrome.app',
+    darwinBinary: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    portFileDir: 'Library/Application Support/Google/Chrome',
+    linuxConfigDir: '.config/google-chrome',
+  },
+  brave: {
+    label: 'Brave',
+    darwinApp: '/Applications/Brave Browser.app',
+    darwinBinary:
+      '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+    portFileDir: 'Library/Application Support/BraveSoftware/Brave-Browser',
+    linuxConfigDir: '.config/BraveSoftware/Brave-Browser',
+  },
+  edge: {
+    label: 'Microsoft Edge',
+    darwinApp: '/Applications/Microsoft Edge.app',
+    darwinBinary:
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    portFileDir: 'Library/Application Support/Microsoft Edge',
+    linuxConfigDir: '.config/microsoft-edge',
+  },
+  chromium: {
+    label: 'Chromium',
+    darwinApp: '/Applications/Chromium.app',
+    darwinBinary: '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    portFileDir: 'Library/Application Support/Chromium',
+    linuxConfigDir: '.config/chromium',
+  },
+};
 
 function getWsUrl() {
   const home = homedir();
@@ -118,29 +215,211 @@ function getWsUrl() {
         })
       : []),
   ].filter(Boolean);
-  const portFile = candidates.find((p) => existsSync(p));
-  if (!portFile)
+  const portFiles = [
+    ...new Set(candidates.filter((p) => existsSync(p))),
+  ];
+  if (portFiles.length === 0)
     throw new Error(
-      'No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging',
+      'CDP_NO_PORT_FILE: No browser is exposing CDP. No DevToolsActivePort file ' +
+        'was found for any supported browser.',
     );
-  const lines = readFileSync(portFile, 'utf8').trim().split('\n');
-  if (lines.length < 2 || !lines[0] || !lines[1])
-    throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
   const host = process.env.CDP_HOST || '127.0.0.1';
-  const port = lines[0].trim();
-  // Fetch the authoritative webSocketDebuggerUrl from /json/version
-  // (Arc and some browsers update the UUID on restart, making DevToolsActivePort stale)
+  const stalePortFiles = [];
+
+  for (const portFile of portFiles) {
+    const lines = readFileSync(portFile, 'utf8').trim().split('\n');
+    if (lines.length < 2 || !lines[0] || !lines[1])
+      throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
+    const port = lines[0].trim();
+    const wsPath = lines[1].trim();
+
+    // Fetch the authoritative webSocketDebuggerUrl from /json/version
+    // (Arc and some browsers update the UUID on restart, making DevToolsActivePort stale).
+    // If the HTTP layer is dead but the port file is live, we fall through to the
+    // WebSocket path advertised in line 2 -- Chromium 144+'s UI-toggle mode disables
+    // /json/* but still serves the WebSocket directly.
+    let httpStatus = null;
+    try {
+      const versionJson = execFileSync(
+        'curl',
+        ['-s', '-o', '/dev/stdout', '-w', '\n%{http_code}',
+         `http://${host}:${port}/json/version`],
+        { timeout: 3000 },
+      ).toString();
+      const newlineIdx = versionJson.lastIndexOf('\n');
+      const body = newlineIdx >= 0 ? versionJson.slice(0, newlineIdx) : versionJson;
+      httpStatus = newlineIdx >= 0 ? parseInt(versionJson.slice(newlineIdx + 1), 10) : null;
+      if (httpStatus === 200 && body) {
+        const version = JSON.parse(body);
+        if (version.webSocketDebuggerUrl)
+          return version.webSocketDebuggerUrl.replace('localhost', host);
+      }
+    } catch (e) {
+      // curl failed entirely: skip a stale discovered endpoint and try another
+      // browser before surfacing the auto-launch diagnostic.
+      if (!isPortListening(host, port)) {
+        try { unlinkSync(portFile); } catch {}
+        stalePortFiles.push(`${portFile} pointing to ${port}`);
+        continue;
+      }
+    }
+
+    // HTTP is dead but a socket IS listening (httpStatus !== 200, but port live).
+    // Most likely: Chromium 144+'s UI-toggle remote-debugging mode -- port open,
+    // /json/* disabled, AND every WebSocket upgrade gets HTTP 403. Probe for
+    // the 403 signature so we can surface a clear, actionable error instead of
+    // a confusing "WebSocket error" later.
+    if (httpStatus !== 200 && probeOriginLockdownSync(host, port, wsPath)) {
+      throw new Error(
+        'CDP_ORIGIN_LOCKDOWN: Browser rejected the CDP WebSocket upgrade ' +
+          'with HTTP 403. The UI-toggle remote-debugging mode is not enough -- ' +
+          'the browser must be (re)launched from the command line.',
+      );
+    }
+
+    return `ws://${host}:${port}${wsPath}`;
+  }
+
+  throw new Error(
+    `CDP_ARC_NOT_RUNNING: Browser is not running (cleaned up stale port ` +
+      `file(s): ${stalePortFiles.join(', ')}).`,
+  );
+}
+
+// Sync TCP probe: is anything listening on host:port right now?
+function isPortListening(host, port) {
+  const result = spawnSync(
+    'nc',
+    ['-z', '-w', '1', host, String(port)],
+    { stdio: 'ignore' },
+  );
+  return result.status === 0;
+}
+
+// Detect Chromium 144+'s origin lockdown: WS upgrade returns HTTP 403.
+function probeOriginLockdownSync(host, port, wsPath) {
+  if (!wsPath) return false;
+  const result = spawnSync(
+    'curl',
+    [
+      '-s', '-o', '/dev/null', '-w', '%{http_code}',
+      '-H', 'Connection: Upgrade',
+      '-H', 'Upgrade: websocket',
+      '-H', 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+      '-H', 'Sec-WebSocket-Version: 13',
+      `http://${host}:${port}${wsPath}`,
+    ],
+    { encoding: 'utf8', timeout: 3000 },
+  );
+  return (result.stdout || '').trim() === '403';
+}
+
+// Quit a browser by binary path. Tries graceful pkill first, then SIGKILL.
+function killBrowser(binary) {
+  spawnSync('pkill', ['-f', binary]);
+  for (let i = 0; i < 25; i++) {
+    const r = spawnSync('pgrep', ['-f', binary], { encoding: 'utf8' });
+    if (!(r.stdout || '').trim()) return;
+    spawnSync('sleep', ['0.3']);
+  }
+  spawnSync('pkill', ['-9', '-f', binary]);
+  spawnSync('sleep', ['1']);
+}
+
+// Quit + relaunch a browser with --remote-debugging-port. Blocks until
+// HTTP /json/version returns 200 on the port, or throws. Returns the
+// resolved port. Skips the relaunch entirely if the browser is already
+// exposing CDP on that port (idempotent).
+//
+// We intentionally use the bare minimum flag set — passing
+// --remote-allow-origins=* OR --user-data-dir alongside the debugging
+// port has been observed to trigger Chromium's "potentially exploited"
+// protections, which silently strip extensions from the user's main
+// profile. The single --remote-debugging-port flag is enough on macOS.
+async function launchBrowser(name, port = 9222, timeoutSec = 20) {
+  const browser = KNOWN_BROWSERS[name];
+  if (!browser) {
+    throw new Error(
+      `Unknown browser "${name}". Known: ${Object.keys(KNOWN_BROWSERS).join(', ')}`,
+    );
+  }
+  const host = process.env.CDP_HOST || '127.0.0.1';
+
+  // Idempotent: skip relaunch if browser already exposing CDP on the port.
+  if (
+    await httpHeadOk(`http://${host}:${port}/json/version`, 1000)
+  ) {
+    process.stderr.write(
+      `${browser.label} already exposing CDP on port ${port}; reusing.\n`,
+    );
+    return port;
+  }
+
+  if (process.platform !== 'darwin') {
+    throw new Error(
+      `Auto-launch is only implemented for macOS right now. ` +
+        `Launch ${browser.label} manually with --remote-debugging-port=${port}.`,
+    );
+  }
+  if (!existsSync(browser.darwinBinary)) {
+    throw new Error(`${browser.label} not found at ${browser.darwinBinary}`);
+  }
+
+  process.stderr.write(`Quitting any running ${browser.label} instances...\n`);
+  killBrowser(browser.darwinBinary);
+
+  process.stderr.write(
+    `Launching ${browser.label} with --remote-debugging-port=${port}...\n`,
+  );
+  spawnSync('open', [
+    '-na', browser.darwinApp,
+    '--args', `--remote-debugging-port=${port}`,
+  ]);
+
+  const deadline = Date.now() + timeoutSec * 1000;
+  while (Date.now() < deadline) {
+    if (await httpHeadOk(`http://${host}:${port}/json/version`, 1000)) {
+      process.stderr.write(`${browser.label} CDP ready on port ${port}.\n`);
+      return port;
+    }
+    await sleep(400);
+  }
+  throw new Error(
+    `${browser.label} did not expose CDP on port ${port} within ${timeoutSec}s. ` +
+      `Check that it launched correctly and nothing else binds ${host}:${port}.`,
+  );
+}
+
+function httpHeadOk(url, timeoutMs = 1000) {
+  return new Promise((res) => {
+    const req = http.get(url, (resp) => {
+      resp.resume();
+      res(resp.statusCode === 200);
+    });
+    req.on('error', () => res(false));
+    req.setTimeout(timeoutMs, () => { req.destroy(); res(false); });
+  });
+}
+
+// Quick CDP liveness check — connect to the browser WS and call Browser.getVersion.
+async function validateBrowserCdp(wsUrl, timeoutMs = 3000) {
+  const cdp = new CDP();
   try {
-    const versionJson = execFileSync(
-      'curl',
-      ['-sf', `http://${host}:${port}/json/version`],
-      { timeout: 3000 },
-    ).toString();
-    const version = JSON.parse(versionJson);
-    if (version.webSocketDebuggerUrl)
-      return version.webSocketDebuggerUrl.replace('localhost', host);
-  } catch {}
-  return `ws://${host}:${port}${lines[1].trim()}`;
+    await Promise.race([
+      (async () => {
+        await cdp.connect(wsUrl);
+        await cdp.send('Browser.getVersion');
+      })(),
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error('preflight timeout')), timeoutMs),
+      ),
+    ]);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { cdp.close(); } catch {}
+  }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -615,6 +894,209 @@ async function loadAllStr(cdp, sid, selector, intervalMs = 1500) {
   return `Clicked "${selector}" ${clicks} time(s) until it disappeared`;
 }
 
+// Mapping for `key <target> <keyname>`. Covers the keys agents actually need.
+// Maps friendly names → { key, code, windowsVirtualKeyCode, text? }.
+const KEY_MAP = {
+  enter:      { key: 'Enter',      code: 'Enter',      windowsVirtualKeyCode: 13, text: '\r' },
+  return:     { key: 'Enter',      code: 'Enter',      windowsVirtualKeyCode: 13, text: '\r' },
+  tab:        { key: 'Tab',        code: 'Tab',        windowsVirtualKeyCode: 9 },
+  escape:     { key: 'Escape',     code: 'Escape',     windowsVirtualKeyCode: 27 },
+  esc:        { key: 'Escape',     code: 'Escape',     windowsVirtualKeyCode: 27 },
+  backspace:  { key: 'Backspace',  code: 'Backspace',  windowsVirtualKeyCode: 8 },
+  delete:     { key: 'Delete',     code: 'Delete',     windowsVirtualKeyCode: 46 },
+  space:      { key: ' ',          code: 'Space',      windowsVirtualKeyCode: 32, text: ' ' },
+  arrowup:    { key: 'ArrowUp',    code: 'ArrowUp',    windowsVirtualKeyCode: 38 },
+  up:         { key: 'ArrowUp',    code: 'ArrowUp',    windowsVirtualKeyCode: 38 },
+  arrowdown:  { key: 'ArrowDown',  code: 'ArrowDown',  windowsVirtualKeyCode: 40 },
+  down:       { key: 'ArrowDown',  code: 'ArrowDown',  windowsVirtualKeyCode: 40 },
+  arrowleft:  { key: 'ArrowLeft',  code: 'ArrowLeft',  windowsVirtualKeyCode: 37 },
+  left:       { key: 'ArrowLeft',  code: 'ArrowLeft',  windowsVirtualKeyCode: 37 },
+  arrowright: { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 },
+  right:      { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 },
+  home:       { key: 'Home',       code: 'Home',       windowsVirtualKeyCode: 36 },
+  end:        { key: 'End',        code: 'End',        windowsVirtualKeyCode: 35 },
+  pageup:     { key: 'PageUp',     code: 'PageUp',     windowsVirtualKeyCode: 33 },
+  pagedown:   { key: 'PageDown',   code: 'PageDown',   windowsVirtualKeyCode: 34 },
+};
+
+// Press a single key (down then up). Use `type` for text input;
+// use `key` for non-character keys like Enter, Tab, Escape, arrows.
+async function keyStr(cdp, sid, keyName) {
+  if (!keyName) throw new Error('key name required (e.g. enter, tab, escape, arrowdown)');
+  const spec = KEY_MAP[keyName.toLowerCase()];
+  if (!spec) {
+    throw new Error(
+      `Unknown key "${keyName}". Known: ${Object.keys(KEY_MAP).join(', ')}`,
+    );
+  }
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', ...spec }, sid);
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...spec }, sid);
+  return `Pressed ${spec.key}`;
+}
+
+// Poll for a CSS selector to appear. Returns element details on success;
+// on timeout, dumps current URL/title/readyState so the agent can see why.
+async function waitStr(cdp, sid, selector, timeoutMsRaw) {
+  if (!selector) throw new Error('CSS selector required');
+  const timeoutMs = timeoutMsRaw ? parseInt(timeoutMsRaw, 10) : 10000;
+  if (isNaN(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('timeoutMs must be a positive number');
+  }
+  const deadline = Date.now() + timeoutMs;
+  const expr = `
+    (function() {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return {
+        tag: el.tagName,
+        text: el.textContent.trim().substring(0, 80),
+        visible: r.width > 0 && r.height > 0,
+      };
+    })()
+  `;
+  while (Date.now() < deadline) {
+    const raw = await evalStr(cdp, sid, expr);
+    if (raw && raw !== 'null' && raw !== '') {
+      const info = JSON.parse(raw);
+      return `Found <${info.tag}> "${info.text}" (visible=${info.visible})`;
+    }
+    await sleep(150);
+  }
+  // Capture page state so the agent can see whether the page didn't load,
+  // the selector is wrong, or the element just hasn't rendered yet.
+  let ctx = '';
+  try {
+    const dump = await evalStr(
+      cdp, sid,
+      `JSON.stringify({ url: location.href, title: document.title, ready: document.readyState, body_chars: (document.body && document.body.innerText.length) || 0 })`,
+    );
+    ctx = ' (' + dump + ')';
+  } catch {}
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for "${selector}"${ctx}`,
+  );
+}
+
+// click+type+Enter as one atomic command. Common pattern for search boxes
+// and single-field forms. Returns a short summary.
+async function submitStr(cdp, sid, selector, text) {
+  if (!selector) throw new Error('selector required');
+  if (text == null) throw new Error('text required');
+  // Click to focus
+  await clickStr(cdp, sid, selector);
+  // Type into focused element
+  if (text !== '') await cdp.send('Input.insertText', { text }, sid);
+  // Press Enter
+  const spec = KEY_MAP.enter;
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', ...spec }, sid);
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...spec }, sid);
+  return `Submitted "${text.slice(0, 60)}" into ${selector}`;
+}
+
+// Probe a CSS selector: returns how many elements matched plus a short
+// description of the first N. Lets agents debug selectors without
+// writing throwaway eval expressions.
+async function probeStr(cdp, sid, selector, limitRaw) {
+  if (!selector) throw new Error('CSS selector required');
+  const limit = limitRaw ? parseInt(limitRaw, 10) : 5;
+  if (isNaN(limit) || limit < 1) throw new Error('limit must be a positive integer');
+  const expr = `
+    (function() {
+      const all = document.querySelectorAll(${JSON.stringify(selector)});
+      const items = Array.from(all).slice(0, ${limit}).map((el) => {
+        const r = el.getBoundingClientRect();
+        // Surface the most informative attributes first.
+        const attrs = {};
+        for (const name of ['id', 'href', 'src', 'aria-label', 'role', 'data-testid', 'name', 'type', 'value']) {
+          const v = el.getAttribute(name);
+          if (v != null) attrs[name] = v.length > 80 ? v.slice(0, 80) + '…' : v;
+        }
+        return {
+          tag: el.tagName.toLowerCase(),
+          classes: (el.className && typeof el.className === 'string')
+            ? el.className.trim().split(/\\s+/).slice(0, 4).join('.')
+            : '',
+          attrs,
+          visible: r.width > 0 && r.height > 0,
+          text: ((el.innerText || el.textContent || '').trim()).slice(0, 120),
+        };
+      });
+      return JSON.stringify({ total: all.length, items });
+    })()
+  `;
+  const raw = await evalStr(cdp, sid, expr);
+  const { total, items } = JSON.parse(raw);
+  if (total === 0) {
+    return `Probe: 0 matches for "${selector}".`;
+  }
+  const lines = [`Probe: ${total} match(es) for "${selector}" (showing ${items.length}):`];
+  items.forEach((it, i) => {
+    const classes = it.classes ? '.' + it.classes : '';
+    const attrPairs = Object.entries(it.attrs).map(([k, v]) => `${k}="${v}"`);
+    const attrStr = attrPairs.length ? ' [' + attrPairs.join(' ') + ']' : '';
+    const vis = it.visible ? '' : ' (hidden)';
+    lines.push(`  [${i}] <${it.tag}${classes}>${attrStr}${vis}`);
+    if (it.text) lines.push(`      text: ${JSON.stringify(it.text)}`);
+  });
+  return lines.join('\n');
+}
+
+// Quick page state snapshot — url + title + readyState + a few hints.
+async function statusStr(cdp, sid) {
+  const raw = await evalStr(
+    cdp, sid,
+    `JSON.stringify({
+      url: location.href,
+      title: document.title,
+      ready: document.readyState,
+      body_chars: (document.body && document.body.innerText.length) || 0,
+      frames: window.frames.length,
+      hidden: document.hidden,
+    })`,
+  );
+  const info = JSON.parse(raw);
+  return [
+    `url:    ${info.url}`,
+    `title:  ${info.title}`,
+    `ready:  ${info.ready}`,
+    `body:   ${info.body_chars} chars`,
+    `frames: ${info.frames}`,
+    `hidden: ${info.hidden}`,
+  ].join('\n');
+}
+
+async function reloadStr(cdp, sid) {
+  await cdp.send('Page.enable', {}, sid);
+  const loadEvent = cdp.waitForEvent('Page.loadEventFired', NAVIGATION_TIMEOUT);
+  await cdp.send('Page.reload', {}, sid);
+  await loadEvent.promise;
+  await waitForDocumentReady(cdp, sid, 5000);
+  return 'Reloaded';
+}
+
+async function historyNavStr(cdp, sid, direction) {
+  const { currentIndex, entries } = await cdp.send(
+    'Page.getNavigationHistory', {}, sid,
+  );
+  const targetIndex = direction === 'back' ? currentIndex - 1 : currentIndex + 1;
+  if (targetIndex < 0 || targetIndex >= entries.length) {
+    throw new Error(`No history entry to go ${direction}`);
+  }
+  await cdp.send('Page.enable', {}, sid);
+  // Back-forward cache hits don't reliably fire loadEventFired, so listen
+  // for it on a short window AND fall back to a readyState poll.
+  const loadEvent = cdp.waitForEvent('Page.loadEventFired', 2000);
+  await cdp.send(
+    'Page.navigateToHistoryEntry',
+    { entryId: entries[targetIndex].id },
+    sid,
+  );
+  try { await loadEvent.promise; } catch { loadEvent.cancel(); }
+  await waitForDocumentReady(cdp, sid, 5000);
+  return `Went ${direction} → ${entries[targetIndex].url}`;
+}
+
 // Send a raw CDP command and return the result as JSON
 async function evalRawStr(cdp, sid, method, paramsJson) {
   if (!method) throw new Error('CDP method required (e.g. "DOM.getDocument")');
@@ -744,6 +1226,30 @@ async function runDaemon(targetId) {
             args[0],
             args[1] ? parseInt(args[1]) : 1500,
           );
+          break;
+        case 'key':
+          result = await keyStr(cdp, sessionId, args[0]);
+          break;
+        case 'submit':
+          result = await submitStr(cdp, sessionId, args[0], args[1] ?? '');
+          break;
+        case 'status':
+          result = await statusStr(cdp, sessionId);
+          break;
+        case 'probe':
+          result = await probeStr(cdp, sessionId, args[0], args[1]);
+          break;
+        case 'wait':
+          result = await waitStr(cdp, sessionId, args[0], args[1]);
+          break;
+        case 'reload':
+          result = await reloadStr(cdp, sessionId);
+          break;
+        case 'back':
+          result = await historyNavStr(cdp, sessionId, 'back');
+          break;
+        case 'forward':
+          result = await historyNavStr(cdp, sessionId, 'forward');
           break;
         case 'evalraw':
           result = await evalRawStr(cdp, sessionId, args[0], args[1]);
@@ -943,28 +1449,60 @@ const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
 
 Usage: cdp <command> [args]
 
+  launch [browser]                  Relaunch a browser with CDP enabled (default: arc)
+                                    Known: arc, chrome, brave, edge, chromium
+                                    Idempotent: skipped if browser already CDP-enabled
   list                              List open pages (shows unique target prefixes)
-  snap  <target>                    Accessibility tree snapshot
-  eval  <target> <expr>             Evaluate JS expression
-  shot  <target> [file]             Screenshot (default: screenshot-<target>.png in runtime dir); prints coordinate mapping
-  html  <target> [selector]         Get HTML (full page or CSS selector)
-  nav   <target> <url>              Navigate to URL and wait for load completion
-  net   <target>                    Network performance entries
-  click   <target> <selector>       Click an element by CSS selector
-  clickxy <target> <x> <y>          Click at CSS pixel coordinates (see coordinate note below)
-  type    <target> <text>           Type text at current focus via Input.insertText
+  snap  [target]                    Accessibility tree snapshot
+  eval  [target] <expr>             Evaluate JS expression
+  shot  [target] [file]             Screenshot (default: screenshot-<target>.png in runtime dir); prints coordinate mapping
+  html  [target] [selector]         Get HTML (full page or CSS selector)
+  nav   [target] <url>              Navigate to URL and wait for load completion
+  net   [target]                    Network performance entries
+  click   [target] <selector>       Click an element by CSS selector
+  clickxy [target] <x> <y>          Click at CSS pixel coordinates (see coordinate note below)
+  type    [target] <text>           Type text at current focus via Input.insertText
                                     Works in cross-origin iframes unlike eval-based approaches
-  loadall <target> <selector> [ms]  Repeatedly click a "load more" button until it disappears
+  loadall [target] <selector> [ms]  Repeatedly click a "load more" button until it disappears
                                     Optional interval in ms between clicks (default 1500)
-  evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
+  key     [target] <name>           Press a single key — enter, tab, escape, esc,
+                                    backspace, delete, space, arrowup/down/left/right
+                                    (or up/down/left/right), home, end, pageup, pagedown
+  wait    [target] <selector> [ms]  Block until selector exists (default 10000ms).
+                                    On timeout, dumps URL/title/readyState for diagnosis.
+  reload  [target]                  Reload the page and wait for load completion
+  back    [target]                  Navigate one entry back in history
+  forward [target]                  Navigate one entry forward in history
+  submit  [target] <selector> <text>  click + insertText + Enter, one atomic action
+                                    for search boxes and single-field forms
+  status  [target]                  Show url, title, readyState, body size, frame count
+  probe   [target] <sel> [n=5]      Inspect a CSS selector: show match count plus
+                                    tag/classes/attrs/text of the first n elements.
+                                    Use when scrape returns 0 or junk to debug the selector.
+  scrape  [target] <container-sel>  Extract structured data from matching elements
+          --limit N                 Limit number of results
+          --field key=<selector>    Field to extract; text is element.innerText
+          --field key=<sel>@<attr>  Use @attr to grab an attribute, e.g. a@href
+  evalraw [target] <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   open  [url]                       Open a new tab (default: about:blank)
                                     Note: each new tab triggers a fresh "Allow debugging?" prompt
   close <target>                    Close a browser tab and its daemon
   stop  [target]                    Stop daemon(s)
 
-<target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
-use more characters.
+GLOBAL FLAGS
+  --launch[=<browser>]              Ensure <browser> (default: arc) is running
+                                    with CDP enabled before the command runs.
+                                    Safe to combine with any command. The
+                                    relaunch is idempotent — if the browser
+                                    is already CDP-enabled, nothing happens.
+
+<target> is a unique targetId prefix from "cdp list". It is OPTIONAL on
+most commands: omitting it falls back to the last-used tab (current-tab),
+which is updated by every command that names a target. The fallback also
+kicks in if the first arg isn't a valid hex prefix — so e.g.
+"cdp click '.menu-btn'" works without you naming the tab. If a prefix is
+ambiguous, use more characters.
 
 COORDINATE SYSTEM
   shot captures the viewport at the device's native resolution.
@@ -990,7 +1528,9 @@ DAEMON IPC (for advanced use / scripting)
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
-  type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
+  type, loadall, key, wait, reload, back, forward, submit, status, evalraw,
+  stop. (scrape is CLI-only — it builds a JS expr and runs it via eval.)
+  Use evalraw to send arbitrary CDP methods.
   The socket disappears after 20 min of inactivity or when the tab closes.
 `;
 
@@ -1010,15 +1550,172 @@ const NEEDS_TARGET = new Set([
   'type',
   'loadall',
   'evalraw',
+  'key',
+  'wait',
+  'reload',
+  'back',
+  'forward',
+  'scrape',
+  'submit',
+  'status',
+  'probe',
 ]);
 
-async function main() {
-  const [cmd, ...args] = process.argv.slice(2);
+// Parse a scrape field spec like:
+//   user='selector'        → { sel: 'selector', attr: null }
+//   link='a@href'          → { sel: 'a',        attr: 'href' }
+//   src='img@src'          → { sel: 'img',      attr: 'src' }
+function parseScrapeArgs(rawArgs) {
+  const positional = [];
+  const fields = []; // [[key, sel, attr], ...]
+  let limit = null;
+  for (let i = 0; i < rawArgs.length; i++) {
+    const a = rawArgs[i];
+    if (a === '--limit' && i + 1 < rawArgs.length) {
+      limit = parseInt(rawArgs[++i], 10);
+    } else if (a.startsWith('--limit=')) {
+      limit = parseInt(a.slice('--limit='.length), 10);
+    } else if (a === '--field' && i + 1 < rawArgs.length) {
+      fields.push(parseFieldSpec(rawArgs[++i]));
+    } else if (a.startsWith('--field=')) {
+      fields.push(parseFieldSpec(a.slice('--field='.length)));
+    } else if (a.startsWith('--')) {
+      throw new Error(`Unknown flag for scrape: ${a}`);
+    } else {
+      positional.push(a);
+    }
+  }
+  return { positional, fields, limit };
+}
 
-  // Daemon mode (internal)
-  if (cmd === '_daemon') {
-    await runDaemon(args[0]);
+function parseFieldSpec(spec) {
+  const eq = spec.indexOf('=');
+  if (eq < 0) {
+    throw new Error(`--field needs key=selector, got "${spec}"`);
+  }
+  const key = spec.slice(0, eq).trim();
+  const value = spec.slice(eq + 1);
+  if (!key) throw new Error(`--field key is empty in "${spec}"`);
+  const atIdx = value.lastIndexOf('@');
+  if (atIdx > 0) {
+    return [key, value.slice(0, atIdx), value.slice(atIdx + 1)];
+  }
+  return [key, value, null];
+}
+
+// Build a JS expression that, when eval'd, returns a JSON string of the
+// scraped results. Each container element is processed independently;
+// when no fields are specified, the element's innerText is returned.
+function buildScrapeExpr(container, fields, limit) {
+  const limitClause = limit && limit > 0 ? `.slice(0, ${limit})` : '';
+  if (fields.length === 0) {
+    return (
+      `JSON.stringify(Array.from(document.querySelectorAll(${JSON.stringify(container)}))` +
+      `${limitClause}.map(el => (el.innerText || el.textContent || '').trim()))`
+    );
+  }
+  const fieldEntries = fields
+    .map(([key, sel, attr]) => {
+      const access = attr
+        ? `inner ? inner.getAttribute(${JSON.stringify(attr)}) : null`
+        : `inner ? (inner.innerText || inner.textContent || '').trim() : null`;
+      return (
+        `[${JSON.stringify(key)}, ((el) => { const inner = el.querySelector(${JSON.stringify(sel)}); return ${access}; })(__el)]`
+      );
+    })
+    .join(', ');
+  return (
+    `JSON.stringify(Array.from(document.querySelectorAll(${JSON.stringify(container)}))` +
+    `${limitClause}.map(__el => Object.fromEntries([${fieldEntries}])))`
+  );
+}
+
+const CDP_SENTINELS = [
+  'CDP_NO_PORT_FILE',
+  'CDP_ARC_NOT_RUNNING',
+  'CDP_ORIGIN_LOCKDOWN',
+  'CDP_PROBE_FAILED',
+];
+
+// Strip a global --launch[=<browser>] flag out of argv. Returns the
+// requested browser name (default "arc") or null if the flag wasn't passed.
+function extractLaunchFlag(argv) {
+  let requested = null;
+  const filtered = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--launch') {
+      requested = requested ?? 'arc';
+    } else if (a.startsWith('--launch=')) {
+      requested = a.slice('--launch='.length) || 'arc';
+    } else {
+      filtered.push(a);
+    }
+  }
+  argv.length = 0;
+  argv.push(...filtered);
+  return requested;
+}
+
+// Resolve args[0] as a target prefix if it looks like hex AND matches
+// exactly one tab. Otherwise fall back to the cached current tab.
+// Returns { targetId, consumed }: consumed=true means args[0] was the target.
+function resolveTargetWithFallback(maybeArg, pages) {
+  const targetIds = pages.map((p) => p.targetId);
+  if (maybeArg && /^[a-fA-F0-9]{2,}$/.test(maybeArg)) {
+    const upper = maybeArg.toUpperCase();
+    const matches = targetIds.filter((id) => id.toUpperCase().startsWith(upper));
+    if (matches.length === 1) return { targetId: matches[0], consumed: true };
+    if (matches.length > 1) {
+      throw new Error(
+        `Ambiguous target prefix "${maybeArg}" — matches ${matches.length} tabs. Use more characters.`,
+      );
+    }
+    // 0 matches → fall through; assume args[0] is a regular command arg.
+  }
+  const current = readCurrentTab();
+  if (current && targetIds.includes(current)) {
+    return { targetId: current, consumed: false };
+  }
+  throw new Error(
+    'No target. Pass a tab ID or run "cdp list" to populate current-tab.',
+  );
+}
+
+// Build the same command line that ran this process, plus `--launch`,
+// so we can suggest it verbatim when CDP fails. Never spell raw
+// `open -a Arc.app …` — that bypasses our vetted relaunch path.
+function buildRerunSuggestion() {
+  const prog = process.argv[1].includes('cdp.mjs') ? 'cdp' : process.argv[1];
+  const rest = process.argv.slice(2);
+  if (rest.some((a) => a === '--launch' || a.startsWith('--launch='))) {
+    return null; // Already had --launch; another suggestion wouldn't help.
+  }
+  return `${prog} ${rest.join(' ')} --launch`.trim();
+}
+
+async function main() {
+  const rawArgs = process.argv.slice(2);
+
+  // Daemon mode (internal) — no flag parsing, raw argv.
+  if (rawArgs[0] === '_daemon') {
+    await runDaemon(rawArgs[1]);
     return;
+  }
+
+  const launchRequested = extractLaunchFlag(rawArgs);
+  const [cmd, ...args] = rawArgs;
+
+  // Explicit launch command.
+  if (cmd === 'launch') {
+    const name = args[0] || 'arc';
+    await launchBrowser(name);
+    return;
+  }
+
+  // Honor --launch flag: ensure browser is up before any command.
+  if (launchRequested) {
+    await launchBrowser(launchRequested);
   }
 
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
@@ -1032,57 +1729,125 @@ async function main() {
     const pages = await getPages(cdp);
     cdp.close();
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
+    // If currentTab still exists, surface it; otherwise pick the first
+    // listed page as a sane default so subsequent commands can omit target.
+    const current = readCurrentTab();
+    if (!current || !pages.some((p) => p.targetId === current)) {
+      if (pages.length > 0) writeCurrentTab(pages[0].targetId);
+    }
     console.log(formatPageList(pages));
     setTimeout(() => process.exit(0), 100);
     return;
   }
 
-  // Open new tab
+  // Open new tab. Waits for load by default; pass --no-wait to return immediately.
   if (cmd === 'open') {
-    const url = args[0] || 'about:blank';
+    const noWait = args.includes('--no-wait');
+    const positional = args.filter((a) => a !== '--no-wait');
+    const url = positional[0] || 'about:blank';
+
     const cdp = new CDP();
     await cdp.connect(getWsUrl());
     const { targetId } = await cdp.send('Target.createTarget', { url });
+
     // Refresh cache; new tab may not appear in getTargets immediately, so add it manually
     const pages = await getPages(cdp);
     if (!pages.some((p) => p.targetId === targetId)) {
       pages.push({ targetId, title: url, url });
     }
-    cdp.close();
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
+    writeCurrentTab(targetId);
+    addOwnedTab(targetId);
+
+    if (noWait || url === 'about:blank' || !/^https?:/i.test(url)) {
+      cdp.close();
+      console.log(`Opened new tab: ${targetId.slice(0, 8)}  ${url}`);
+      setTimeout(() => process.exit(0), 100);
+      return;
+    }
+
+    // Wait for the new tab's load event via a flat session.
+    try {
+      const { sessionId } = await cdp.send('Target.attachToTarget', {
+        targetId, flatten: true,
+      });
+      await cdp.send('Page.enable', {}, sessionId);
+      const loadEvent = cdp.waitForEvent('Page.loadEventFired', NAVIGATION_TIMEOUT);
+      try { await loadEvent.promise; } catch { loadEvent.cancel(); }
+      await waitForDocumentReady(cdp, sessionId, 5000);
+    } catch {
+      // Best-effort: opening succeeded even if the wait failed.
+    }
+    cdp.close();
+
     console.log(`Opened new tab: ${targetId.slice(0, 8)}  ${url}`);
     setTimeout(() => process.exit(0), 100);
     return;
   }
 
-  // Close tab
+  // Close tab(s). "close all" closes ONLY tabs ccdp itself opened —
+  // the user's own tabs are left untouched (SAFETY: never close tabs
+  // we don't own).
   if (cmd === 'close') {
-    const targetPrefix = args[0];
-    if (!targetPrefix) {
-      console.error('Error: target ID required. Run "cdp list" first.');
-      process.exit(1);
+    if (args[0] === 'all') {
+      const owned = readOwnedTabs();
+      if (owned.length === 0) {
+        console.log('No ccdp-owned tabs to close.');
+        setTimeout(() => process.exit(0), 100);
+        return;
+      }
+      const cdpC = new CDP();
+      await cdpC.connect(getWsUrl());
+      const live = await getPages(cdpC);
+      const liveIds = new Set(live.map((p) => p.targetId));
+      // Intersect owned ∩ live so we don't try closing tabs the user
+      // already manually closed.
+      const toClose = owned.filter((id) => liveIds.has(id));
+      let closed = 0;
+      for (const id of toClose) {
+        try {
+          await cdpC.send('Target.closeTarget', { targetId: id });
+          closed++;
+        } catch {}
+        await stopDaemons(id);
+      }
+      cdpC.close();
+      writeOwnedTabs([]);
+      // Rewrite page cache to drop closed tabs.
+      const remaining = live.filter((p) => !toClose.includes(p.targetId));
+      writeFileSync(PAGES_CACHE, JSON.stringify(remaining), { mode: 0o600 });
+      // Clear current-tab if it was a closed one.
+      const current = readCurrentTab();
+      if (current && toClose.includes(current)) {
+        try { unlinkSync(CURRENT_TAB_FILE); } catch {}
+      }
+      const otherLive = live.length - closed;
+      console.log(
+        `Closed ${closed} ccdp-owned tab(s); left ${otherLive} other tab(s) untouched.`,
+      );
+      setTimeout(() => process.exit(0), 100);
+      return;
     }
+
     if (!existsSync(PAGES_CACHE)) {
       console.error('No page list cached. Run "cdp list" first.');
       process.exit(1);
     }
     const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
-    const targetId = resolvePrefix(
-      targetPrefix,
-      pages.map((p) => p.targetId),
-      'target',
-      'Run "cdp list".',
-    );
+    const { targetId } = resolveTargetWithFallback(args[0], pages);
+
     // Stop daemon for this tab first (if running)
-    await stopDaemons(targetPrefix);
+    await stopDaemons(targetId);
     // Close the browser tab
     const cdp = new CDP();
     await cdp.connect(getWsUrl());
     await cdp.send('Target.closeTarget', { targetId });
     cdp.close();
-    // Update cache
+    // Update cache and clear current-tab if it was this one
     const remaining = pages.filter((p) => p.targetId !== targetId);
     writeFileSync(PAGES_CACHE, JSON.stringify(remaining), { mode: 0o600 });
+    clearCurrentTab(targetId);
+    removeOwnedTab(targetId);
     console.log(`Closed tab: ${targetId.slice(0, 8)}`);
     setTimeout(() => process.exit(0), 100);
     return;
@@ -1094,37 +1859,94 @@ async function main() {
     return;
   }
 
-  // Page commands — need target prefix
+  // Page commands — need a target (explicit or current-tab fallback)
   if (!NEEDS_TARGET.has(cmd)) {
     console.error(`Unknown command: ${cmd}\n`);
     console.log(USAGE);
     process.exit(1);
   }
 
-  const targetPrefix = args[0];
-  if (!targetPrefix) {
-    console.error('Error: target ID required. Run "cdp list" first.');
-    process.exit(1);
+  // Resolve target → full targetId, refreshing pages cache if it's missing
+  // or stale. This lets agents skip "cdp list" before commands.
+  let pages;
+  if (existsSync(PAGES_CACHE)) {
+    pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
+  } else {
+    const cdpLocal = new CDP();
+    await cdpLocal.connect(getWsUrl());
+    pages = await getPages(cdpLocal);
+    cdpLocal.close();
+    writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
   }
-
-  // Resolve prefix → full targetId from pages cache
-  if (!existsSync(PAGES_CACHE)) {
-    console.error('No page list cached. Run "cdp list" first.');
-    process.exit(1);
-  }
-  const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
-  const targetId = resolvePrefix(
-    targetPrefix,
-    pages.map((p) => p.targetId),
-    'target',
-    'Run "cdp list".',
-  );
+  const { targetId, consumed } = resolveTargetWithFallback(args[0], pages);
+  writeCurrentTab(targetId);
 
   const conn = await getOrStartTabDaemon(targetId);
 
-  const cmdArgs = args.slice(1);
+  const cmdArgs = consumed ? args.slice(1) : args.slice(0);
 
-  if (cmd === 'eval') {
+  if (cmd === 'scrape') {
+    // CLI-side: parse --field/--limit, build JS expr, dispatch as eval.
+    let parsed;
+    try {
+      parsed = parseScrapeArgs(cmdArgs);
+    } catch (e) {
+      console.error('Error:', e.message);
+      process.exit(1);
+    }
+    const container = parsed.positional[0];
+    if (!container) {
+      console.error('Error: container selector required, e.g. scrape "article"');
+      process.exit(1);
+    }
+    const expr = buildScrapeExpr(container, parsed.fields, parsed.limit);
+    const response = await sendCommand(conn, { cmd: 'eval', args: [expr] });
+    if (!response.ok) {
+      console.error('Error:', response.error);
+      process.exitCode = 1;
+      return;
+    }
+    let data;
+    try { data = JSON.parse(response.result); } catch {
+      console.log(response.result);
+      return;
+    }
+
+    // Diagnostic line to stderr so JSON on stdout stays consumable.
+    // Empty results almost always mean the container selector is wrong;
+    // surface that loudly so the agent doesn't silently move on.
+    const total = Array.isArray(data) ? data.length : 0;
+    if (total === 0) {
+      console.error(
+        `Scrape: 0 matches for container "${container}". ` +
+          `Check the selector; e.g. try cdp eval 'document.querySelectorAll(${JSON.stringify(container)}).length'.`,
+      );
+    } else if (parsed.fields.length > 0) {
+      const allNull = data.filter((item) =>
+        item && typeof item === 'object' &&
+        Object.values(item).every((v) => v == null || v === ''),
+      ).length;
+      console.error(
+        `Scrape: ${total} containers matched` +
+          (allNull > 0
+            ? `, ${allNull} had no fields populated (selector mismatch?)`
+            : ''),
+      );
+    } else {
+      console.error(`Scrape: ${total} containers matched`);
+    }
+    console.log(JSON.stringify(data, null, 2));
+    return;
+  }
+
+  if (cmd === 'submit') {
+    // submit <selector> <text...> — join remaining args as text body.
+    if (!cmdArgs[0]) {
+      console.error('Error: selector required, e.g. submit \'input[type="search"]\' "your query"');
+      process.exit(1);
+    }
+    if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
+  } else if (cmd === 'eval') {
     const expr = cmdArgs.join(' ');
     if (!expr) {
       console.error('Error: expression required');
@@ -1156,7 +1978,14 @@ async function main() {
   const response = await sendCommand(conn, { cmd, args: cmdArgs });
 
   if (response.ok) {
-    if (response.result) console.log(response.result);
+    if (response.result) {
+      console.log(response.result);
+    } else if (cmd === 'eval') {
+      // eval often returns ''/undefined when an expression evaluates to
+      // a falsy/empty value. A silent stdout looks like a failure to the
+      // agent, so make the empty result explicit.
+      console.error('(empty result — expression returned empty string, null, or undefined)');
+    }
   } else {
     console.error('Error:', response.error);
     process.exitCode = 1;
@@ -1164,6 +1993,17 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error(e.message);
+  const msg = e.message || String(e);
+  if (CDP_SENTINELS.some((s) => msg.includes(s))) {
+    const rerun = buildRerunSuggestion();
+    console.error(`Error: ${msg}`);
+    if (rerun) {
+      console.error(
+        `\nTo auto-launch the browser with CDP enabled and retry, run:\n  ${rerun}`,
+      );
+    }
+  } else {
+    console.error(msg);
+  }
   process.exit(1);
 });
